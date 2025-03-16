@@ -11,7 +11,7 @@
 import sys
 import argparse
 import json
-importsubprocess
+import subprocess
 
 #ceph osd stat
 #ceph mon stat
