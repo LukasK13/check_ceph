@@ -1,214 +1,293 @@
 #!/usr/bin/python3
+"""
+Nagios/Icinga check for Ceph clusters. Runs on the monitoring server using the
+ceph client; supply a ceph.conf, keyring and user to access the cluster.
 
-# Examples:
-# osd status, warn at 2 missing, crit at 3: ./check_ceph.py -C ceph.conf --id icinga -k ceph.client.icinga.keyring --osd -w 2 -c 3
-# general health statis: /check_ceph.py -C ceph.conf --id icinga -k ceph.client.icinga.keyring --health
-# pg status, does not take warning or critical arguments yet. Only warns on PGs not in an active+clean state which means some PGs are not in an optimal state. ./check_ceph.py -C ceph.conf --id icinga -k ceph.client.icinga.keyring --pg
-# extra performance metrics (iops, read/write bytes/sec): ./check_ceph.py -C ceph.conf --id icinga -k ceph.client.icinga.keyring --perf
-# disk space, if run with --pool you only alert on that pool. when run without --pool the thresholds are for every pool. warning and ciritcal are the max avail fields from `ceph df`: ./check_ceph.py -C ceph.conf --id icinga -k ceph.client.icinga.keyring --df -w 100 -c 50
-#
-#
+Examples:
+  General health:   ./check_ceph.py -C ceph.conf --id icinga -k ceph.client.icinga.keyring --health
+  OSD status:       ./check_ceph.py -C ceph.conf --id icinga -k ceph.client.icinga.keyring --osd -w 2 -c 3
+                    (warn at 2 OSDs down/out, crit at 3)
+  MON quorum:       ./check_ceph.py -C ceph.conf --id icinga -k ceph.client.icinga.keyring --mon -w 1 -c 2
+                    (thresholds = MONs missing from quorum, default 1 / 2)
+  PG status:        ./check_ceph.py -C ceph.conf --id icinga -k ceph.client.icinga.keyring --pg
+                    (warns if any PG is not active+clean)
+  Perf metrics:     ./check_ceph.py -C ceph.conf --id icinga -k ceph.client.icinga.keyring --perf
+  Disk space:       ./check_ceph.py -C ceph.conf --id icinga -k ceph.client.icinga.keyring --df -w 100 -c 50 [--pool rbd] [-b T]
+                    (thresholds = MAX AVAIL per pool in the unit given by -b; without --pool every pool is checked)
+
+Supports the pre-Luminous and the Luminous+/Nautilus+ JSON formats.
+"""
 import sys
 import argparse
 import json
 import subprocess
 
-#ceph osd stat
-#ceph mon stat
-#ceph pg stat
-#ceph health statua
-#ceph mon_status
-#ceph quorum status
+OK, WARNING, CRITICAL, UNKNOWN = 0, 1, 2, 3
+STATE_NAMES = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
+
+
+def nagios_exit(code, message, perfdata=""):
+    out = message
+    if perfdata:
+        out += "|" + perfdata.strip()
+    print(out)
+    sys.exit(code)
+
+
+def ceph(args, *cmd):
+    """Run a ceph command and return its parsed JSON output. Any failure -> UNKNOWN."""
+    command = ["ceph", "--id", args.id]
+    if args.conf:
+        command += ["-c", args.conf]
+    if args.keyring:
+        command += ["-k", args.keyring]
+    command += list(cmd) + ["--format", "json"]
+
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=args.timeout, check=True)
+    except FileNotFoundError:
+        nagios_exit(UNKNOWN, "UNKNOWN: ceph binary not found in PATH")
+    except subprocess.TimeoutExpired:
+        nagios_exit(UNKNOWN, f"UNKNOWN: 'ceph {' '.join(cmd)}' timed out after {args.timeout}s "
+                             "(cluster unreachable or no MON quorum?)")
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode(errors="replace").strip().splitlines()
+        nagios_exit(UNKNOWN, f"UNKNOWN: 'ceph {' '.join(cmd)}' failed (rc={e.returncode}): "
+                             f"{err[-1] if err else 'no error output'}")
+
+    try:
+        return json.loads(result.stdout)
+    except ValueError:
+        nagios_exit(UNKNOWN, f"UNKNOWN: could not parse JSON from 'ceph {' '.join(cmd)}'")
+
+
+def thresholds(args, default_warn=None, default_crit=None):
+    warn = args.warning if args.warning is not None else default_warn
+    crit = args.critical if args.critical is not None else default_crit
+    if warn is None or crit is None:
+        nagios_exit(UNKNOWN, "UNKNOWN: this check needs -w/--warning and -c/--critical")
+    try:
+        return float(warn), float(crit)
+    except ValueError:
+        nagios_exit(UNKNOWN, f"UNKNOWN: thresholds must be numbers (got -w {warn} -c {crit})")
+
 
 def checkHealth(args):
+    health = ceph(args, "health")
 
-    ceph_health_json=subprocess.check_output(["ceph --id {0} -c {1} -k {2} --format json health".format(args.id, args.conf, args.keyring)],shell=True)
-    ceph_health_dict = json.loads(ceph_health_json)
+    # Luminous+: 'status' / 'checks'; older: 'overall_status' / 'summary'
+    status = health.get("status") or health.get("overall_status") or "UNKNOWN"
 
-    if ceph_health_dict['status'] == 'HEALTH_WARN':
-        print(f"{ceph_health_dict['overall_status']}: {ceph_health_dict['summary'][0]['summary']}")
-        sys.exit(1)
-    elif ceph_health_dict['status'] == 'HEALTH_OK':
-        print(ceph_health_dict['status'])
-        sys.exit(0)
+    messages = []
+    if "checks" in health:
+        severity_order = {"HEALTH_ERR": 0, "HEALTH_WARN": 1}
+        checks = sorted(health["checks"].items(),
+                        key=lambda kv: severity_order.get(kv[1].get("severity"), 2))
+        for name, check in checks:
+            msg = f"{name}: {check.get('summary', {}).get('message', '')}"
+            if check.get("muted"):
+                msg += " [muted]"
+            messages.append(msg)
+    else:
+        messages = [s.get("summary", "") for s in health.get("summary", [])]
+
+    code = {"HEALTH_OK": OK, "HEALTH_WARN": WARNING, "HEALTH_ERR": CRITICAL}.get(status, UNKNOWN)
+    text = status if not messages else f"{status}: " + "; ".join(messages)
+    nagios_exit(code, text)
+
 
 def checkOSD(args):
-    if args.warning:
-        WARN = float(args.warning)
-    if args.critical:
-        CRIT = float(args.critical)
-    osd_stat_json=subprocess.check_output([f"ceph --id {args.id} -c {args.conf} -k {args.keyring} --format json osd stat"], shell=True)
-    osd_stat_dict = json.loads(osd_stat_json)
-    osd_not_up = osd_stat_dict['num_osds'] - osd_stat_dict['num_up_osds']
-    osd_not_in = osd_stat_dict['num_osds'] - osd_stat_dict['num_in_osds']
-    perf_string=f"num_osds={osd_stat_dict['num_osds']} num_up_osds={osd_stat_dict['num_up_osds']} num_in_osds={osd_stat_dict['num_in_osds']}"
+    warn, crit = thresholds(args)
+    stat = ceph(args, "osd", "stat")
+    stat = stat.get("osdmap", stat)  # Luminous/Mimic nest everything under 'osdmap'
 
-#Build in logic to handle the full and near full keys that are returned in the json
-    if (osd_not_up >= WARN and osd_not_up < CRIT) or (osd_not_in >= WARN and osd_not_in < CRIT):
-        print(f"WARNING: ALL OSDs are not up and in. {osd_stat_dict['num_osds']} OSDS. {osd_stat_dict['num_up_osds']} up, {osd_stat_dict['num_in_osds']} in|{perf_string}")
-        sys.exit(1)
-    elif (osd_not_up >= CRIT) or (osd_not_in >= CRIT):
-        print(f"CRITICAL: ALL OSDs are not up and in. {osd_stat_dict['num_osds']} OSDS. {osd_stat_dict['num_up_osds']} up, {osd_stat_dict['num_in_osds']} in|{perf_string}")
-        sys.exit(2)
-    elif (osd_stat_dict['num_osds'] == osd_stat_dict['num_in_osds']) and (osd_stat_dict['num_osds'] == osd_stat_dict['num_up_osds']):
-        print(f"ALL OSDs are up and in. {osd_stat_dict['num_osds']} OSDS. {osd_stat_dict['num_up_osds']} up, {osd_stat_dict['num_in_osds']} in|{perf_string}")
-        sys.exit(0)
+    num, up, inn = stat["num_osds"], stat["num_up_osds"], stat["num_in_osds"]
+    missing = max(num - up, num - inn)
+    perf = f"num_osds={num} num_up_osds={up} num_in_osds={inn}"
+    summary = f"{num} OSDs, {up} up, {inn} in"
+
+    if missing >= crit:
+        nagios_exit(CRITICAL, f"CRITICAL: not all OSDs are up and in. {summary}", perf)
+    elif missing >= warn:
+        nagios_exit(WARNING, f"WARNING: not all OSDs are up and in. {summary}", perf)
+    elif missing > 0:
+        nagios_exit(OK, f"OK: {missing} OSD(s) down/out, below warning threshold. {summary}", perf)
     else:
-        print("Script shouldn't reach this point. There may be bugs!")
-        sys.exit(3)
+        nagios_exit(OK, f"OK: all OSDs are up and in. {summary}", perf)
+
 
 def checkMON(args):
-    if args.warning:
-        WARN = float(args.warning)
-    if args.critical:
-        CRIT = float(args.critical)
-    #not written yet, more important things
+    warn, crit = thresholds(args, default_warn=1, default_crit=2)
+    quorum = ceph(args, "quorum_status")
+
+    all_mons = [m["name"] for m in quorum["monmap"]["mons"]]
+    in_quorum = quorum.get("quorum_names", [])
+    missing = sorted(set(all_mons) - set(in_quorum))
+    perf = f"num_mons={len(all_mons)} mons_in_quorum={len(in_quorum)}"
+    summary = (f"{len(in_quorum)}/{len(all_mons)} MONs in quorum, "
+               f"leader {quorum.get('quorum_leader_name', '?')}")
+    if missing:
+        summary += f", missing: {', '.join(missing)}"
+
+    if len(missing) >= crit:
+        nagios_exit(CRITICAL, f"CRITICAL: {summary}", perf)
+    elif len(missing) >= warn:
+        nagios_exit(WARNING, f"WARNING: {summary}", perf)
+    else:
+        nagios_exit(OK, f"OK: {summary}", perf)
+
+
+def _pg_is_clean(state_name):
+    flags = set(state_name.split("+"))
+    return {"active", "clean"} <= flags and "inconsistent" not in flags
+
 
 def checkPG(args):
-    pg_stat_json=subprocess.check_output([f"ceph --id {args.id} -c {args.conf} -k {args.keyring} --format json pg stat"], shell=True)
-    pg_stat_dict=json.loads(pg_stat_json)
-    #cheap fix for nautilus change in json output
-    if 'num_pgs' in pg_stat_dict.keys():
-        #pre nautilus json format
-        pg_summary=pg_stat_dict
-    elif 'pg_summary' in pg_stat_dict.keys():
-        #nautilus json format
-        pg_summary = pg_stat_dict['pg_summary']
-    num_pgs = pg_summary['num_pgs']
-    active_pgs=0
-    perf_string=""
-    for x in pg_summary['num_pg_by_state']:
-        if "active+clean" in x['name']:
-            active_pgs += x['num']
-        perf_string += f"{x['name']}={x['num']} "
-#Maybe build in a percentage based threshold for users who want to have thresholds like that
-    if active_pgs < num_pgs:
-        print(f"WARNING: All PGs are not active+clean: {num_pgs} PGs Total, {perf_string}|{perf_string}")
-        sys.exit(1)
-    elif active_pgs == num_pgs:
-        print(f"All PGs are active+clean: {num_pgs} PGs Total, {perf_string}|{perf_string}")
-        sys.exit(0)
+    stat = ceph(args, "pg", "stat")
+    summary = stat.get("pg_summary", stat)  # Nautilus+ nests under 'pg_summary'
+
+    num_pgs = summary.get("num_pgs", 0)
+    states = summary.get("num_pg_by_state", [])
+    if num_pgs == 0 or not states:
+        nagios_exit(UNKNOWN, "UNKNOWN: no PG statistics available yet (mgr just restarted?)")
+
+    clean = sum(s["num"] for s in states if _pg_is_clean(s["name"]))
+    not_clean = [f"{s['num']} {s['name']}" for s in states if not _pg_is_clean(s["name"])]
+    perf = f"num_pgs={num_pgs} " + " ".join(f"'{s['name']}'={s['num']}" for s in states)
+
+    if clean < num_pgs:
+        nagios_exit(WARNING, f"WARNING: {num_pgs - clean} of {num_pgs} PGs not active+clean: "
+                             + ", ".join(not_clean), perf)
     else:
-        print("Script shouldn't reach this point. There may be bugs!")
-        sys.exit(3)
+        nagios_exit(OK, f"OK: all {num_pgs} PGs are active+clean", perf)
+
 
 def checkPerf(args):
-    pg_stat_json=subprocess.check_output([f"ceph --id {args.id} -c {args.conf} -k {args.keyring} --format json pg stat"], shell=True)
-    pg_stat_dict=json.loads(pg_stat_json)
-    if 'read_bytes_sec' not in  pg_stat_dict:
-        pg_stat_dict['read_bytes_sec'] = 0
-    if 'write_bytes_sec' not in  pg_stat_dict:
-        pg_stat_dict['write_bytes_sec'] = 0
-    if 'io_sec' not in  pg_stat_dict:
-        pg_stat_dict['io_sec'] = 0
-    perf_string=f"read_bytes_sec={pg_stat_dict['read_bytes_sec']} write_bytes_sec={pg_stat_dict['write_bytes_sec']} io_sec={pg_stat_dict['io_sec']}"
-    print(f"Healthy: Additional perf stats for cluster {perf_string}|{perf_string}")
-    sys.exit(0)
-        
+    # 'ceph status' -> pgmap carries the client IO rates in all versions since Luminous.
+    # Keys are omitted while the value is 0.
+    status = ceph(args, "status")
+    pgmap = status.get("pgmap", {})
+    rb = pgmap.get("read_bytes_sec", 0)
+    wb = pgmap.get("write_bytes_sec", 0)
+    rop = pgmap.get("read_op_per_sec", 0)
+    wop = pgmap.get("write_op_per_sec", 0)
+    io = pgmap.get("io_sec", rop + wop)
+
+    perf = (f"read_bytes_sec={rb} write_bytes_sec={wb} read_op_per_sec={rop} "
+            f"write_op_per_sec={wop} io_sec={io}")
+    nagios_exit(OK, f"OK: client IO {rb / 1024**2:.1f} MiB/s rd, {wb / 1024**2:.1f} MiB/s wr, "
+                    f"{rop} op/s rd, {wop} op/s wr", perf)
+
+
 def checkDF(args):
-    if args.warning:
-        WARN = float(args.warning)
-    if args.critical:
-        CRIT = float(args.critical)        
-    if args.byte:
-        if args.byte == "T":
-            byte_divisor=1024**4
-            perf_metric="TB"
-        elif args.byte == "G":
-            byte_divisor=1024**3
-            perf_metric="GB"
-        elif args.byte == "P":
-            byte_divisor=1024**5
-            perf_metric="PB"
-    else:
-        byte_divisor=1024**4
-        perf_metric="TB"
+    warn, crit = thresholds(args)
+    if crit > warn:
+        nagios_exit(UNKNOWN, "UNKNOWN: for --df the thresholds are free space, so -c must be <= -w")
 
-    ceph_df_json=subprocess.check_output([f"ceph --id {args.id} -c {args.conf} -k {args.keyring} --format json df"], shell=True)
-    ceph_df_dict=json.loads(ceph_df_json)
-    #get global stats
-    global_bytes, global_used_bytes, global_avail_bytes = ceph_df_dict['stats']['total_bytes'], ceph_df_dict['stats']['total_used_bytes'], ceph_df_dict['stats']['total_avail_bytes']
-    global_total=global_bytes / byte_divisor
-    global_used=global_used_bytes / byte_divisor
-    global_avail=global_avail_bytes / byte_divisor
-    
-    #get all pool stats
-    pool_stats = {}
-    for pool in ceph_df_dict['pools']:
-        pool_stats[pool['name']] = {'bytes_used': pool['stats']['bytes_used'] / byte_divisor, 'max_avail': pool['stats']['max_avail'] / byte_divisor, 'objects': pool['stats']['objects']}
+    units = {"G": ("GB", 1024**3), "T": ("TB", 1024**4), "P": ("PB", 1024**5)}
+    unit_key = (args.byte or "T").upper()
+    if unit_key not in units:
+        nagios_exit(UNKNOWN, f"UNKNOWN: invalid -b/--byte '{args.byte}', use G, T or P")
+    unit, div = units[unit_key]
 
-    perf_string=f"global_total_bytes={global_bytes / byte_divisor}{perf_metric} global_used_bytes={global_used_bytes / byte_divisor}{perf_metric} global_avail_bytes={global_avail_bytes / byte_divisor}{perf_metric} "
-    for item in pool_stats.keys():
-        perf_string += f"{item}_bytes_used={pool_stats[item]['bytes_used']}{perf_metric,pool_stats[item]['max_avail']} {item}_max_avail={pool_stats[item]['objects']}{perf_metric,pool_stats[item]['max_avail']} {item}_objects={4} "
+    df = ceph(args, "df")
+    st = df["stats"]
+    pools = {}
+    for p in df["pools"]:
+        s = p["stats"]
+        pools[p["name"]] = {
+            "bytes_used": s.get("bytes_used", s.get("kb_used", 0) * 1024),
+            "max_avail": s["max_avail"],
+            "objects": s.get("objects", 0),
+        }
 
-#if pool is defined alert on that. if pool is not defined alert on the max_avail of all pools if any cross threshold
-    if args.pool in pool_stats.keys():
-#        print pool_stats[args.pool]
-#add in percentage later
-        if (pool_stats[args.pool]['max_avail'] < WARN) and (pool_stats[args.pool]['max_avail'] > CRIT):
-            print(f"WARNING: Ceph pool {args.pool} has {pool_stats[args.pool]['max_avail']}{perf_metric} availbale|{perf_string}")
-            sys.exit(1)
-        elif pool_stats[args.pool]['max_avail'] < CRIT:
-            print(f"CRITICAL: Ceph pool {args.pool} has {pool_stats[args.pool]['max_avail']}{perf_metric} availbale|{perf_string}")
-            sys.exit(2)
-        elif pool_stats[args.pool]['max_avail'] > WARN:
-            prin(f"Healthy: Ceph pool {args.pool} has {pool_stats[args.pool]['max_avail']}{perf_metric} availbale|{perf_string}")
-            sys.exit(0)
+    # Perfdata in plain bytes (UOM 'B'), graphers scale this themselves
+    perf = [f"global_total_bytes={st['total_bytes']}B",
+            f"global_used_bytes={st['total_used_bytes']}B",
+            f"global_avail_bytes={st['total_avail_bytes']}B"]
+    for name, p in pools.items():
+        perf += [f"'{name}_bytes_used'={p['bytes_used']}B",
+                 f"'{name}_max_avail'={p['max_avail']}B;{int(warn * div)};{int(crit * div)};0",
+                 f"'{name}_objects'={p['objects']}"]
+    perf = " ".join(perf)
+
+    def fmt(b):
+        return f"{b / div:.2f}{unit}"
+
+    if args.pool:
+        if args.pool not in pools:
+            nagios_exit(UNKNOWN, f"UNKNOWN: pool '{args.pool}' not found "
+                                 f"(available: {', '.join(sorted(pools))})", perf)
+        avail = pools[args.pool]["max_avail"] / div
+        text = f"Ceph pool {args.pool} has {fmt(pools[args.pool]['max_avail'])} available"
+        if avail < crit:
+            nagios_exit(CRITICAL, f"CRITICAL: {text}", perf)
+        elif avail < warn:
+            nagios_exit(WARNING, f"WARNING: {text}", perf)
         else:
-            print("Script shouldn't reach this point. There may be bugs!")
-            sys.exit(3)
+            nagios_exit(OK, f"OK: {text}", perf)
 
+    crit_list, warn_list = [], []
+    for name, p in sorted(pools.items()):
+        avail = p["max_avail"] / div
+        if avail < crit:
+            crit_list.append(f"{name}:{fmt(p['max_avail'])}")
+        elif avail < warn:
+            warn_list.append(f"{name}:{fmt(p['max_avail'])}")
+
+    if crit_list:
+        nagios_exit(CRITICAL, f"CRITICAL: Ceph pool(s) critically low on free space. "
+                              f"Critical: {', '.join(crit_list)}"
+                              + (f" Warning: {', '.join(warn_list)}" if warn_list else ""), perf)
+    elif warn_list:
+        nagios_exit(WARNING, f"WARNING: Ceph pool(s) low on free space: {', '.join(warn_list)}", perf)
     else:
-        #Alerts based on all pools. If any pool is crossing the threshold we alert on it
-        warn_list = []
-        crit_list = []
+        nagios_exit(OK, f"OK: all {len(pools)} Ceph pools are within free space thresholds, "
+                        f"{fmt(st['total_avail_bytes'])} raw free", perf)
 
-        for key in pool_stats.keys():
-            if (pool_stats[key]['max_avail'] < WARN) and (pool_stats[key]['max_avail'] > CRIT):
-                warn_list.append(f"{key}:{pool_stats[key]['max_avail']}{perf_metric}")
-            elif pool_stats[key]['max_avail'] < CRIT:
-                crit_list.append(f"{key}:{pool_stats[key]['max_avail']}{perf_metric}")
 
-        if (len(warn_list) > 0) and (len(crit_list) == 0):
-            print(f"WARNING: Ceph pool(s) low on free space. {warn_list}|{perf_string}")
-            sys.exit(1)
-        elif len(crit_list) > 0:
-            print(f"CRITICAL: Ceph pool(s) critically low on free space. Critial:{crit_list} Warning:{warn_list}|{perf_string}")
-            sys.exit(2)
-        elif (len(warn_list) == 0) and (len(crit_list) == 0):
-            print(f"Healthy: All ceph pools are within free space thresholds|{perf_string}")
-        else:
-            print("Script shouldn't reach this point. There may be bugs!")
-            sys.exit(3)
-            
-                
-
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description='Runs health checks against a ceph cluster. This is designed to run on the monitoring server using the ceph client software. Supply a ceph.conf, keyring, and user to access the cluster.')
-    parser.add_argument('-C','--conf', help='ceph.conf file, defaults to /etc/ceph/ceph.conf.')
-    parser.add_argument('-id','--id', help='Ceph authx user',required=True)
-    parser.add_argument('-k','--keyring', help='Path to ceph keyring if not in /etc/ceph/client.\$id.keyring')
-    parser.add_argument('--health', help='Get general health status. ex. HEALTH_OK, HEALTH_WARN',action="store_true")
-    parser.add_argument('-o','--osd', help='OSD status. Thresholds are in number of OSDs missing',action="store_true")
-    parser.add_argument('-m','--mon', help='MON status. Thesholds are in number of mons missing')
-    parser.add_argument('-p','--pg', help='PG status. No thresholds due to the large number of pg states.',action="store_true")
-    parser.add_argument('--perf', help='collects additional ceph performance statistics',action='store_true')
-    parser.add_argument('--df', help='Disk/cluster usage. Reports global and all pools unless --pool is used. Warning and critical are number of -b free to the pools. This is not Raw Free, but Max Avail to the pools based on rep or k,m settings. If you do not define a pool the threshold is run agains all the pools in the cluster.',action="store_true")
-    parser.add_argument('-b','--byte', help="Format to use for displaying DF data. G=Gigabyte, T=Terabyte. Use with the --df option. Defults to TB")
-    parser.add_argument('--pool',help='Pool. Use with df')
-    parser.add_argument('--objects', help='Object counts based on pool')
-    parser.add_argument('-w','--warning',help='Warning threshold. See specific checks for value types')
-    parser.add_argument('-c','--critical',help='Critical threshold. See specific checks for value types')
+    parser.add_argument('-C', '--conf', help='ceph.conf file, defaults to /etc/ceph/ceph.conf.')
+    parser.add_argument('-id', '--id', help='Ceph authx user', required=True)
+    parser.add_argument('-k', '--keyring', help='Path to ceph keyring if not in /etc/ceph/client.$id.keyring')
+    parser.add_argument('--health', help='Get general health status. ex. HEALTH_OK, HEALTH_WARN', action="store_true")
+    parser.add_argument('-o', '--osd', help='OSD status. Thresholds are in number of OSDs down or out', action="store_true")
+    parser.add_argument('-m', '--mon', help='MON quorum. Thresholds are in number of MONs missing from quorum (default -w 1 -c 2)', action="store_true")
+    parser.add_argument('-p', '--pg', help='PG status. No thresholds due to the large number of pg states.', action="store_true")
+    parser.add_argument('--perf', help='collects additional ceph performance statistics', action='store_true')
+    parser.add_argument('--df', help='Disk/cluster usage. Reports global and all pools unless --pool is used. Warning and critical are amounts (in -b units) free to the pools. This is not Raw Free, but Max Avail to the pools based on rep or k,m settings. If you do not define a pool the threshold is run against all the pools in the cluster.', action="store_true")
+    parser.add_argument('-b', '--byte', help="Unit for DF data and thresholds: G, T or P. Use with --df. Defaults to T")
+    parser.add_argument('--pool', help='Pool. Use with --df')
+    parser.add_argument('--objects', help='Object counts based on pool (not implemented)')
+    parser.add_argument('-w', '--warning', help='Warning threshold. See specific checks for value types')
+    parser.add_argument('-c', '--critical', help='Critical threshold. See specific checks for value types')
+    parser.add_argument('-t', '--timeout', type=int, default=30, help='Timeout for ceph commands in seconds (default 30)')
 
     args = parser.parse_args()
-    
+
     if args.health:
         checkHealth(args)
     elif args.osd:
         checkOSD(args)
+    elif args.mon:
+        checkMON(args)
     elif args.pg:
         checkPG(args)
     elif args.df:
-        checkDF(args) 
+        checkDF(args)
     elif args.perf:
         checkPerf(args)
+    else:
+        parser.print_usage()
+        nagios_exit(UNKNOWN, "UNKNOWN: no check selected (--health, --osd, --mon, --pg, --perf or --df)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:  # never hand Nagios a traceback (exit 1 = WARNING)
+        nagios_exit(UNKNOWN, f"UNKNOWN: unexpected error {type(e).__name__}: {e}")
